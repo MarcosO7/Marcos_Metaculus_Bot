@@ -619,14 +619,25 @@ class FallTemplateBot2025(ForecastBot):
                             mapping = {str(k): float(v) for k, v in val.items()}
                             break
                 if mapping is None:
-                    pairs: dict[str, float] = {}
-                    for line in text.splitlines():
-                        m = re.match(r"\s*(.+?):\s*([0-9]+(?:\.[0-9]+)?)%\s*$", line)
-                        if m:
-                            key = m.group(1).strip()
-                            val = float(m.group(2)) / 100.0
-                            pairs[key] = val
-                    mapping = {opt: pairs.get(opt, 0.0) for opt in question.options}
+                    # 1) Try to parse enumerated outputs like: "Option_1: 8%" aligned to the given order
+                    enum_pairs: dict[str, float] = {}
+                    # Accept variations: Option_1, Option 1, Option-1, case-insensitive, ':' or '-' separators
+                    for m in re.finditer(r"(?i)\boption\s*[_\-\s]?\s*(\d+)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)%\b", text):
+                        idx = int(m.group(1)) - 1
+                        if 0 <= idx < len(question.options):
+                            enum_pairs[question.options[idx]] = float(m.group(2)) / 100.0
+                    if enum_pairs:
+                        mapping = {opt: enum_pairs.get(opt, 0.0) for opt in question.options}
+                    else:
+                        # 2) Fallback: parse as "<Option Name>: 12%"
+                        pairs: dict[str, float] = {}
+                        for line in text.splitlines():
+                            m = re.match(r"\s*(.+?):\s*([0-9]+(?:\.[0-9]+)?)%\s*$", line)
+                            if m:
+                                key = m.group(1).strip()
+                                val = float(m.group(2)) / 100.0
+                                pairs[key] = val
+                        mapping = {opt: pairs.get(opt, 0.0) for opt in question.options}
                 s = sum(mapping.values())
                 if s == 0:
                     return None
@@ -657,8 +668,36 @@ class FallTemplateBot2025(ForecastBot):
             for probs, tag in panel:
                 if opt in probs:
                     series.append((probs[opt], tag))
-            trimmed = self._drop_min_max(series) if len(series) >= 3 else series
-            agg[opt] = self._weighted_average(trimmed)
+            if series:
+                trimmed = self._drop_min_max(series) if len(series) >= 3 else series
+                agg[opt] = self._weighted_average(trimmed)
+            else:
+                # If we have no data for this option, do NOT default to 0.5 —
+                # that would create uniform outputs after normalization.
+                agg[opt] = 0.0
+        # If no panel entries parsed at all, fall back to a simple mention-based prior to avoid uniform distribution
+        if not panel:
+            try:
+                texts_all = "\n\n".join([*(strong_texts or []), *(cheap_texts or [])])
+                counts: dict[str, int] = {}
+                for opt in question.options:
+                    # Count case-insensitive whole-word-ish mentions
+                    pattern = re.compile(rf"\b{re.escape(opt)}\b", re.IGNORECASE)
+                    counts[opt] = len(pattern.findall(texts_all))
+                total_mentions = sum(counts.values())
+                if total_mentions == 0:
+                    # Deterministic slight tilt by position to avoid flatness
+                    n = len(question.options)
+                    weights = [n - i for i in range(n)]
+                    wsum = float(sum(weights))
+                    agg = {opt: weights[i] / wsum for i, opt in enumerate(question.options)}
+                else:
+                    agg = {opt: (counts[opt] + 1) for opt in question.options}  # +1 smoothing
+                    s_counts = float(sum(agg.values()))
+                    agg = {opt: agg[opt] / s_counts for opt in question.options}
+                panel_reasoning.append("[fallback] used mentions-based prior due to parsing failures")
+            except Exception as e:
+                logger.warning(f"MC fallback prior failed: {e}")
         # Renormalize
         s = sum(agg.values())
         if s > 0:
@@ -676,7 +715,14 @@ class FallTemplateBot2025(ForecastBot):
         # initial normalization
         s = sum(p)
         if s <= 0:
-            p = [1.0 / len(opts)] * len(opts)
+            # Avoid exact uniform if we completely failed to parse — apply a tiny deterministic tilt by index
+            n = len(opts)
+            if n > 0:
+                weights = [n - i for i in range(n)]
+                wsum = float(sum(weights))
+                p = [w / wsum for w in weights]
+            else:
+                p = []
         else:
             p = [x / s for x in p]
         # clip to [lo, hi]
@@ -706,6 +752,16 @@ class FallTemplateBot2025(ForecastBot):
                 idx = next((i for i, x in enumerate(p) if x > lo + 1e-9), None)
                 if idx is not None:
                     p[idx] = max(lo, p[idx] + rem)
+        # Detect and gently break exact uniformity to avoid degenerate equal splits
+        n = len(opts)
+        if n > 1:
+            uniform_val = 1.0 / n
+            if all(abs(x - uniform_val) < 1e-9 for x in p):
+                # apply a tiny deterministic tilt by index
+                weights = [n - i for i in range(n)]
+                wsum = float(sum(weights))
+                p = [min(hi, max(lo, w / wsum)) for w in weights]
+
         smoothed = {opt: val for opt, val in zip(opts, p)}
 
         # Build PredictedOptionList directly to avoid parser variability
