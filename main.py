@@ -815,6 +815,12 @@ class FallTemplateBot2025(ForecastBot):
         )
 
         async def extract_percentiles(text: str) -> dict[int, float] | None:
+            """Extract P10..P90 from a model response.
+            First try LLM-structured parsing; if that fails, fall back to regex.
+            Returns dict mapping 10..90 -> float, or None.
+            """
+            needed = {10, 20, 30, 40, 50, 60, 70, 80, 90}
+            # 1) Try LLM-assisted parsing
             try:
                 plist: list[Percentile] = await structure_output(
                     text, list[Percentile], model=parser_llm
@@ -822,14 +828,32 @@ class FallTemplateBot2025(ForecastBot):
                 pts: dict[int, float] = {}
                 for p in plist:
                     if hasattr(p, "percentile") and hasattr(p, "value"):
-                        pts[int(getattr(p, "percentile"))] = float(getattr(p, "value"))
-                needed = {10, 20, 30, 40, 50, 60, 70, 80, 90}
-                if not needed.issubset(set(pts.keys())):
-                    return None
-                return pts
+                        # Percentile may come back as 10 or 0.1; normalize to 10..90 ints
+                        raw_perc = getattr(p, "percentile")
+                        perc_int = int(round(float(raw_perc) * 100)) if float(raw_perc) <= 1.0 else int(raw_perc)
+                        pts[perc_int] = float(getattr(p, "value"))
+                if needed.issubset(set(pts.keys())):
+                    return {k: float(pts[k]) for k in sorted(needed)}
             except Exception as e:
-                logger.warning(f"Numeric parse failed: {e}")
-                return None
+                logger.warning(f"Numeric parse failed (LLM): {e}")
+
+            # 2) Regex fallback
+            try:
+                import re as _re
+                matches = _re.findall(r"Percentile\s*(10|20|30|40|50|60|70|80|90)\s*:\s*([-+]?\d+(?:[\.,]\d+)?)", text)
+                if not matches:
+                    return None
+                pts: dict[int, float] = {}
+                for k, v in matches:
+                    try:
+                        pts[int(k)] = float(str(v).replace(",", "."))
+                    except Exception:
+                        continue
+                if needed.issubset(set(pts.keys())):
+                    return {k: float(pts[k]) for k in sorted(needed)}
+            except Exception as e:
+                logger.warning(f"Numeric parse failed (regex): {e}")
+            return None
 
         panel: list[tuple[dict[int, float], str]] = []
         for tag, texts in (("strong", strong_texts), ("efficient", cheap_texts)):
@@ -839,7 +863,8 @@ class FallTemplateBot2025(ForecastBot):
                     panel.append((pts, tag))
 
         combined: dict[int, float] = {}
-        for q in [10, 20, 30, 40, 50, 60, 70, 80, 90]:
+        q_list = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+        for q in q_list:
             series: list[tuple[float, str]] = []
             for pts, tag in panel:
                 if q in pts:
@@ -847,10 +872,68 @@ class FallTemplateBot2025(ForecastBot):
             trimmed = self._drop_min_max(series) if len(series) >= 3 else series
             combined[q] = self._weighted_average(trimmed)
 
-        agg_text = "\n".join([f"Percentile {q}: {combined[q]}" for q in [10,20,30,40,50,60,70,80,90]])
-        percentile_list: list[Percentile] = await structure_output(
-            agg_text, list[Percentile], model=parser_llm
-        )
+        # Enforce monotonicity and sensible spread to avoid invalid CDF posting
+        def _clamp(v: float) -> float:
+            try:
+                lo = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
+                hi = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
+                if not question.open_lower_bound and lo is not None:
+                    v = max(v, float(lo))
+                if not question.open_upper_bound and hi is not None:
+                    v = min(v, float(hi))
+            except Exception:
+                pass
+            return v
+
+        values = [float(_clamp(combined[q])) for q in q_list]
+        # Non-decreasing pass
+        for i in range(1, len(values)):
+            if values[i] < values[i - 1]:
+                values[i] = values[i - 1]
+
+        # Ensure some width; if collapsed, expand using bounds or a scale around median
+        spread = values[-1] - values[0]
+        try:
+            lo = question.lower_bound
+            hi = question.upper_bound
+        except Exception:
+            lo = None
+            hi = None
+
+        if spread <= 0:
+            if lo is not None and hi is not None and float(hi) > float(lo):
+                lo_f, hi_f = float(lo), float(hi)
+                # Fill linearly across the closed bounds at the requested percentiles
+                values = [lo_f + (hi_f - lo_f) * (q / 100.0) for q in q_list]
+            else:
+                # Use a heuristic width around the median
+                m = values[4]
+                base = float(m)
+                # width scales with magnitude; ensure a minimum width
+                width = max(abs(base) * 0.2, 1.0)
+                offsets = [-0.40, -0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40]
+                values = [base + width * off for off in offsets]
+
+        # Make strictly increasing with a tiny epsilon to avoid identical x values
+        # Epsilon relative to scale or bounds
+        try:
+            scale = (float(hi) - float(lo)) if (lo is not None and hi is not None) else max(abs(values[4]), 1.0)
+        except Exception:
+            scale = max(abs(values[4]), 1.0)
+        eps = max(scale * 1e-9, 1e-9)
+        for i in range(1, len(values)):
+            if values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + eps
+        # Final clamp to hard bounds if closed (maintain monotonicity afterwards)
+        for i in range(len(values)):
+            values[i] = _clamp(values[i])
+            if i > 0 and values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + eps
+
+        # Construct Percentile objects directly (avoid extra LLM parsing)
+        percentile_list: list[Percentile] = [
+            Percentile(percentile=q / 100.0, value=values[i]) for i, q in enumerate(q_list)
+        ]
         prediction = NumericDistribution.from_question(percentile_list, question)
         reasoning = (
             "Panel forecasts (7), per-percentile drop min/max, weight strong x2."
@@ -964,7 +1047,7 @@ if __name__ == "__main__":
     elif run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/39700/french-pms-grouping-on-december-31-2025/"
+            "https://www.metaculus.com/questions/39330/what-will-be-the-percentage-increase-for-the-minimum-wage-in-colombia-for-2026/"
         ]
         template_bot.skip_previously_forecasted_questions = False
         questions = [
